@@ -28,6 +28,7 @@ import re
 from r2egym.agenthub.utils.utils import match_dockerimage_to_repo
 from r2egym.agenthub import SUPPORTED_REPOS, SKIP_FILES, SKIP_FILES_NEW, CMD_TIMEOUT
 import concurrent.futures
+import shlex
 
 from r2egym.agenthub.trajectory.swebench_utils import (
     make_test_spec,
@@ -42,6 +43,15 @@ from kubernetes import client, config, watch
 
 # For Kubernetes exec.
 from kubernetes.stream import stream
+from typing import Optional
+
+# For E2B backend
+try:
+    from e2b import Sandbox
+    E2B_AVAILABLE = True
+except ImportError:
+    E2B_AVAILABLE = False
+    # Sandbox = None
 
 DEFAULT_NAMESPACE = "default"
 DOCKER_PATH = "/root/.venv/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -93,7 +103,7 @@ class DockerRuntime(ExecutionEnvironment):
     ):
         # check if ds is provided (required for all dockers moving forward)
         assert ds, f"Dataset not provided for docker image: {docker_image}"
-        assert backend in ["docker", "kubernetes"], f"Invalid backend: {backend}"
+        assert backend in ["docker", "kubernetes", "e2b"], f"Invalid backend: {backend}"
         # swebench specific setup
         self.ds = ds
         self.backend = backend
@@ -105,6 +115,8 @@ class DockerRuntime(ExecutionEnvironment):
         else:
             raise ValueError(f"No docker image found in ds: {self.ds}")
         self.docker_image = ds_image if not docker_image else docker_image
+        if self.backend == 'e2b':
+            self.template_id = ds['template_id']
         self.swebench_verified = "swebench" in self.docker_image
         self.swesmith = "swesmith" in self.docker_image
         if self.swesmith:
@@ -136,6 +148,8 @@ class DockerRuntime(ExecutionEnvironment):
                 logger_name = "DockerRuntime"
             elif self.backend == "kubernetes":
                 logger_name = "KubernetesRuntime"
+            elif self.backend == "e2b":
+                logger_name = "E2BRuntime"
             else:
                 raise ValueError(f"Invalid backend: {self.backend}")
             self.logger = get_logger(logger_name)  # Pass the module name for clarity
@@ -151,6 +165,11 @@ class DockerRuntime(ExecutionEnvironment):
             except Exception:
                 config.load_kube_config()
             self.client = client.CoreV1Api()
+        elif self.backend == "e2b":
+            if not E2B_AVAILABLE:
+                raise ImportError("e2b package is not installed.")
+            self.client = None
+            self.sandbox: Sandbox = None
 
         # Start the container
         self.container = None
@@ -180,6 +199,13 @@ class DockerRuntime(ExecutionEnvironment):
                 else "N/A"
             )
             self.logger.info("Pod Name: %s", pod_name)
+        elif self.backend == "e2b":
+            sandbox_id = (
+                self.sandbox.sandbox_id
+                if hasattr(self, 'sandbox') and self.sandbox
+                else "N/A"
+            )
+            self.logger.info("E2B Sandbox ID: %s", sandbox_id)
 
     @staticmethod
     def _get_container_name(image_name: str) -> str:
@@ -347,6 +373,42 @@ class DockerRuntime(ExecutionEnvironment):
                 self.logger.error(f"Failed to check pod status after watch error: {status_error}")
                 raise RuntimeError(f"Failed to verify pod status: {status_error}")
 
+    def _start_e2b_sandbox_with_retry(
+        self, docker_image: str, command: str, sandbox_name: str, **docker_kwargs
+    ):
+        """
+        Starts an E2B sandbox.
+
+        Args:
+            docker_image: The Docker image name (used to determine template if needed).
+            command: The command to run.
+            sandbox_name: The desired name for the sandbox (used for logging).
+            **docker_kwargs: Additional keyword arguments. Can include:
+                             - e2b_template_id: E2B template ID to use (default: "base")
+                             - api_key: E2B API key (if not set via env var)
+        """
+        template_id = self.template_id
+
+        backoff = 5
+        while True:
+            try:
+                self.sandbox = Sandbox.create(template=template_id)
+                if isinstance(command, list):
+                    command = shlex.join(command)
+                self.sandbox.commands.run(command)
+                self.container = self.sandbox
+                self.logger.info(f"E2B sandbox started: {self.sandbox.sandbox_id} (template: {template_id})")
+                break
+            except Exception as e:
+                if 'limit' in e.__str__():
+                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 40)
+                    continue
+                else:
+                    self.logger.error(f"Failed to start E2B sandbox: {e}")
+                    raise
+
     def start_container(
         self, docker_image: str, command: str, ctr_name: str, **docker_kwargs
     ):
@@ -373,6 +435,10 @@ class DockerRuntime(ExecutionEnvironment):
                     )
             elif self.backend == "kubernetes":
                 self._start_kubernetes_pod(
+                    docker_image, command, ctr_name, **docker_kwargs
+                )
+            elif self.backend == "e2b":
+                self._start_e2b_sandbox_with_retry(
                     docker_image, command, ctr_name, **docker_kwargs
                 )
         except Exception as e:
@@ -444,14 +510,39 @@ class DockerRuntime(ExecutionEnvironment):
                 )
                 raise e  # Re-raise unexpected errors
 
+    def _stop_e2b_sandbox_with_retry(self):
+        """
+        Stops and closes the E2B sandbox.
+        """
+        backoff = 2
+        while True:
+            try:
+                if hasattr(self, 'sandbox') and self.sandbox:
+                    sandbox_id = self.sandbox.sandbox_id
+                    self.sandbox.kill()
+                    self.logger.info(f"E2B sandbox closed: {sandbox_id}")
+                    self.sandbox = None
+                    self.container = None
+            except Exception as e:
+                if 'limit' in e.__str__():
+                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during stop, retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 40)
+                    continue
+                else:
+                    self.logger.error(f"Error closing E2B sandbox: {e}")
+                    raise
+
     def stop_container(self):
         try:
-            if self.container:
+            if self.container or self.sandbox:
                 if self.backend == "docker":
                     self.container.stop()
                     self.container.remove()
                 elif self.backend == "kubernetes":
                     self._stop_kubernetes_pod()
+                elif self.backend == "e2b":
+                    self._stop_e2b_sandbox_with_retry()
         except Exception as e:
             print("Container stop/delete error:", repr(e))
     
@@ -686,6 +777,76 @@ class DockerRuntime(ExecutionEnvironment):
             self.logger.error(f"Unexpected error during Kubernetes exec: {repr(e)}")
             return f"Error: {repr(e)}", "-1"
 
+    def _run_e2b_with_retry(
+        self,
+        code: str | list[str],
+        timeout: int = CMD_TIMEOUT,
+        args: str = "",
+        workdir: str = "",
+    ) -> tuple[str, str]:
+        """
+        在 E2B sandbox 中执行命令。
+        
+        使用 sandbox.commands.run() 来执行命令，该方法会等待命令完成并返回 CommandResult。
+        """
+        if isinstance(code, list):
+            code = shlex.join(code)
+        command = ""
+        if workdir:
+            command += f"cd {workdir} && "
+        command += f"timeout {timeout} {code} {args}"
+        
+        backoff = 2
+        while True:
+            try:
+                def execute_command():
+                    result = self.sandbox.commands.run(
+                        shlex.join(['/bin/sh', '-c', command]),
+                        cwd=workdir if workdir != "" else None,
+                        timeout=timeout + 10,  # 命令连接超时，给一些缓冲时间
+                    )
+                    # CommandResult includes stdout, stderr, exit_code, error
+                    return result
+
+                # 使用 ThreadPoolExecutor 来处理额外的超时保护
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(execute_command)
+                    try:
+                        result = future.result(timeout=timeout + 15)  # 额外的超时缓冲
+                    except concurrent.futures.TimeoutError:
+                        self.logger.error(f"E2B exec Overall Timeout: {timeout + 15}s")
+                        return f"The command took too long to execute (>{timeout}s)", "-1"
+
+                # 合并 stdout 和 stderr 作为输出
+                output = result.stdout
+                if result.stderr:
+                    output += "\n" + result.stderr
+
+                # 处理退出码
+                exit_code = result.exit_code
+
+                # 如果命令超时（timeout 命令返回 124）
+                if exit_code == 124:
+                    self.logger.error(f"E2B exec Internal Timeout via 'timeout' command: {timeout}s")
+                    return f"The command took too long to execute (>{timeout}s)", "-1"
+
+                if exit_code != 0:
+                    self.logger.error(f"E2B exec Error: Exit code {exit_code}\nError Message: {output}")
+                    return output, f"Error: Exit code {exit_code}"
+                
+                # 移除 ANSI 转义码和 \r 字符
+                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                return output, str(exit_code)
+            except Exception as e:
+                if 'limit' in e.__str__():
+                    self.logger.warning(f"Received resource limit from E2B sandbox during exec, retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 40)
+                    continue
+                else:
+                    self.logger.error(f"Unexpected error during E2B exec: {repr(e)}")
+                    return f"Error: {repr(e)}", "-1"
+
     def run(
         self,
         code: str,
@@ -707,6 +868,8 @@ class DockerRuntime(ExecutionEnvironment):
 
         if self.backend == "kubernetes":
             return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir)
+        elif self.backend == "e2b":
+            return self._run_e2b_with_retry(exec_code, timeout, args, workdir=exec_workdir)
 
         command = f"timeout {timeout} {exec_code} {args}"
         try:
@@ -829,9 +992,41 @@ class DockerRuntime(ExecutionEnvironment):
                     self.logger.error(f"Copy to container failed after {max_retries} attempts: {str(e)}")
                     raise
 
+    def _copy_to_container_e2b_with_retry(self, src_path: str, dest_path: str):
+        """
+        将文件或目录从主机复制到 E2B sandbox。
+        """
+        backoff = 2
+        while True:
+            try:
+                if os.path.isdir(src_path):
+                    for root, dirs, files in os.walk(src_path):
+                        for file in files:
+                            src_file = os.path.join(root, file)
+                            rel_path = os.path.relpath(src_file, src_path)
+                            dest_file = os.path.join(dest_path, rel_path).replace("\\", "/")
+                            with open(src_file, "rb") as f:
+                                src_data = f.read()
+                            self.sandbox.files.write(dest_file, src_data)
+                    self.logger.info(f"Copied directory {src_path} to E2B sandbox at {dest_path}")
+                else:
+                    with open(src_path, "rb") as f:
+                        src_data = f.read()
+                    self.sandbox.files.write(dest_path, src_data)
+                    self.logger.info(f"Copied {src_path} to E2B sandbox at {dest_path}")
+            except Exception as e:
+                if 'limit' in e.__str__():
+                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during copy, retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 40)
+                    continue
+                else:
+                    self.logger.error(f"Error copying file to E2B sandbox: {e}")
+                    raise
+
     def copy_to_container(self, src_path: str, dest_path: str):
         """
-        Copies a file or directory from the host into the container (Docker or Kubernetes).
+        Copies a file or directory from the host into the container (Docker, Kubernetes, or E2B).
         """
         if self.backend == "docker":
             tar_stream = io.BytesIO()
@@ -839,9 +1034,11 @@ class DockerRuntime(ExecutionEnvironment):
                 tar.add(src_path, arcname=os.path.basename(dest_path))
             tar_stream.seek(0)
             self.container.put_archive(os.path.dirname(dest_path), tar_stream.read())
-        else:
+        elif self.backend == "kubernetes":
             # Kubernetes pod copy
             return self._copy_to_container_kubernetes(src_path, dest_path)
+        elif self.backend == "e2b":
+            return self._copy_to_container_e2b_with_retry(src_path, dest_path)
 
     @DeprecationWarning  # TODO: remove dependency on this method with new dockers
     def read_file(self, rel_file_path: str) -> str:
@@ -1083,6 +1280,9 @@ class DockerRuntime(ExecutionEnvironment):
         self.stop_container()
         if self.backend == "docker":
             self.client.close()
+        elif self.backend == "e2b":
+            # E2B sandbox has been closed in stop_container
+            pass
 
     def run_swebv_regression(
         self, run_tests_regression: str | None = None, timeout: int = 300
