@@ -401,12 +401,12 @@ class DockerRuntime(ExecutionEnvironment):
                 break
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
                 else:
-                    self.logger.error(f"Failed to start E2B sandbox: {e}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})Failed to start E2B sandbox: {e}")
                     raise
 
     def start_container(
@@ -520,17 +520,17 @@ class DockerRuntime(ExecutionEnvironment):
                 if hasattr(self, 'sandbox') and self.sandbox:
                     sandbox_id = self.sandbox.sandbox_id
                     self.sandbox.kill()
-                    self.logger.info(f"E2B sandbox closed: {sandbox_id}")
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})E2B sandbox closed: {sandbox_id}")
                     self.sandbox = None
                     self.container = None
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during stop, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during stop, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
                 else:
-                    self.logger.error(f"Error closing E2B sandbox: {e}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})Error closing E2B sandbox: {e}")
                     raise
 
     def stop_container(self):
@@ -814,7 +814,7 @@ class DockerRuntime(ExecutionEnvironment):
                     try:
                         result = future.result(timeout=timeout + 15)  # 额外的超时缓冲
                     except concurrent.futures.TimeoutError:
-                        self.logger.error(f"E2B exec Overall Timeout: {timeout + 15}s")
+                        self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Overall Timeout: {timeout + 15}s")
                         return f"The command took too long to execute (>{timeout}s)", "-1"
 
                 # 合并 stdout 和 stderr 作为输出
@@ -827,11 +827,11 @@ class DockerRuntime(ExecutionEnvironment):
 
                 # 如果命令超时（timeout 命令返回 124）
                 if exit_code == 124:
-                    self.logger.error(f"E2B exec Internal Timeout via 'timeout' command: {timeout}s")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Internal Timeout via 'timeout' command: {timeout}s")
                     return f"The command took too long to execute (>{timeout}s)", "-1"
 
                 if exit_code != 0:
-                    self.logger.error(f"E2B exec Error: Exit code {exit_code}\nError Message: {output}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Error: Exit code {exit_code}\nError Message: {output}")
                     return output, f"Error: Exit code {exit_code}"
                 
                 # 移除 ANSI 转义码和 \r 字符
@@ -839,12 +839,12 @@ class DockerRuntime(ExecutionEnvironment):
                 return output, str(exit_code)
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"Received resource limit from E2B sandbox during exec, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received resource limit from E2B sandbox during exec, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
                 else:
-                    self.logger.error(f"Unexpected error during E2B exec: {repr(e)}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})Unexpected error during E2B exec: {repr(e)}")
                     return f"Error: {repr(e)}", "-1"
 
     def run(
@@ -1008,7 +1008,7 @@ class DockerRuntime(ExecutionEnvironment):
                             with open(src_file, "rb") as f:
                                 src_data = f.read()
                             self.sandbox.files.write(dest_file, src_data)
-                    self.logger.info(f"Copied directory {src_path} to E2B sandbox at {dest_path}")
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})Copied directory {src_path} to E2B sandbox at {dest_path}")
                 else:
                     with open(src_path, "rb") as f:
                         src_data = f.read()
@@ -1016,12 +1016,12 @@ class DockerRuntime(ExecutionEnvironment):
                     self.logger.info(f"Copied {src_path} to E2B sandbox at {dest_path}")
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"Received 429 Too Many Requests from E2B sandbox during copy, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during copy, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
                 else:
-                    self.logger.error(f"Error copying file to E2B sandbox: {e}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})Error copying file to E2B sandbox: {e}")
                     raise
 
     def copy_to_container(self, src_path: str, dest_path: str):
