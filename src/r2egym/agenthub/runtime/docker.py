@@ -374,7 +374,7 @@ class DockerRuntime(ExecutionEnvironment):
                 raise RuntimeError(f"Failed to verify pod status: {status_error}")
 
     def _start_e2b_sandbox_with_retry(
-        self, docker_image: str, command: str, sandbox_name: str, **docker_kwargs
+        self, docker_image: str, command: str|list[str], sandbox_name: str, **docker_kwargs
     ):
         """
         Starts an E2B sandbox.
@@ -395,7 +395,7 @@ class DockerRuntime(ExecutionEnvironment):
                 self.sandbox = Sandbox.create(template=template_id)
                 if isinstance(command, list):
                     command = shlex.join(command)
-                self.sandbox.commands.run(command)
+                self.sandbox.commands.run("sudo " + command)
                 self.container = self.sandbox
                 self.logger.info(f"E2B sandbox started: {self.sandbox.sandbox_id} (template: {template_id})")
                 break
@@ -801,7 +801,7 @@ class DockerRuntime(ExecutionEnvironment):
             try:
                 def execute_command():
                     result = self.sandbox.commands.run(
-                        shlex.join(['/bin/sh', '-c', command]),
+                        shlex.join(['sudo /bin/sh', '-c', command]),
                         cwd=workdir if workdir != "" else None,
                         timeout=timeout + 10,  # 命令连接超时，给一些缓冲时间
                     )
