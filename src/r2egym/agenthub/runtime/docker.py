@@ -392,7 +392,7 @@ class DockerRuntime(ExecutionEnvironment):
         backoff = 5
         while True:
             try:
-                self.sandbox = Sandbox.create(template=template_id)
+                self.sandbox = Sandbox.create(template=template_id, timeout=300)
                 if isinstance(command, list):
                     command = shlex.join(command)
                 self.sandbox.commands.run("sudo " + command)
@@ -800,6 +800,7 @@ class DockerRuntime(ExecutionEnvironment):
         while True:
             try:
                 def execute_command():
+                    self.sandbox.set_timeout(300)
                     result = self.sandbox.commands.run(
                         shlex.join(['sudo /bin/sh', '-c', command]),
                         cwd=workdir if workdir != "" else None,
@@ -1000,6 +1001,7 @@ class DockerRuntime(ExecutionEnvironment):
         while True:
             try:
                 if os.path.isdir(src_path):
+                    self.sandbox.set_timeout(300)
                     for root, dirs, files in os.walk(src_path):
                         for file in files:
                             src_file = os.path.join(root, file)
