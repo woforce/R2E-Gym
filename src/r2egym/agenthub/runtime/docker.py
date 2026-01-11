@@ -43,7 +43,7 @@ from kubernetes import client, config, watch
 
 # For Kubernetes exec.
 from kubernetes.stream import stream
-from typing import Optional
+from typing import Optional, Dict
 
 # For E2B backend
 try:
@@ -393,20 +393,23 @@ class DockerRuntime(ExecutionEnvironment):
         while True:
             try:
                 self.sandbox = Sandbox.create(template=template_id, timeout=300)
+                self.sandbox_id = self.sandbox.sandbox_id
                 if isinstance(command, list):
                     command = shlex.join(command)
-                self.sandbox.commands.run("sudo " + command)
+                self.sandbox.commands.run(cmd=command)
                 self.container = self.sandbox
                 self.logger.info(f"E2B sandbox started: {self.sandbox.sandbox_id} (template: {template_id})")
                 break
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
+                elif 'CommandExitException' in e.__class__.__name__:
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Failed to start E2B sandbox: {e}. The command is[{command}].")
                 else:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})Failed to start E2B sandbox: {e}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Failed to start E2B sandbox: {e}")
                     raise
 
     def start_container(
@@ -520,17 +523,19 @@ class DockerRuntime(ExecutionEnvironment):
                 if hasattr(self, 'sandbox') and self.sandbox:
                     sandbox_id = self.sandbox.sandbox_id
                     self.sandbox.kill()
-                    self.logger.info(f"[{self.docker_image}]({self.template_id})E2B sandbox closed: {sandbox_id}")
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B sandbox closed: {sandbox_id}")
                     self.sandbox = None
+                    self.sandbox_id = None
                     self.container = None
+                break
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during stop, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Received 429 Too Many Requests from E2B sandbox during stop, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
                 else:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})Error closing E2B sandbox: {e}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Error closing E2B sandbox: {e}")
                     raise
 
     def stop_container(self):
@@ -783,6 +788,7 @@ class DockerRuntime(ExecutionEnvironment):
         timeout: int = CMD_TIMEOUT,
         args: str = "",
         workdir: str = "",
+        envs:Dict[str, str] = None,
     ) -> tuple[str, str]:
         """
         在 E2B sandbox 中执行命令。
@@ -794,7 +800,7 @@ class DockerRuntime(ExecutionEnvironment):
         command = ""
         if workdir:
             command += f"cd {workdir} && "
-        command += f"timeout {timeout} {code} {args}"
+        command += f"timeout {timeout} {code.strip()} {args}"
         
         backoff = 2
         while True:
@@ -802,8 +808,9 @@ class DockerRuntime(ExecutionEnvironment):
                 def execute_command():
                     self.sandbox.set_timeout(300)
                     result = self.sandbox.commands.run(
-                        shlex.join(['sudo /bin/sh', '-c', command]),
+                        cmd=command,
                         cwd=workdir if workdir != "" else None,
+                        envs={"PATH": DOCKER_PATH},
                         timeout=timeout + 10,  # 命令连接超时，给一些缓冲时间
                     )
                     # CommandResult includes stdout, stderr, exit_code, error
@@ -815,38 +822,42 @@ class DockerRuntime(ExecutionEnvironment):
                     try:
                         result = future.result(timeout=timeout + 15)  # 额外的超时缓冲
                     except concurrent.futures.TimeoutError:
-                        self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Overall Timeout: {timeout + 15}s")
+                        self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Overall Timeout: {timeout + 15}s")
                         return f"The command took too long to execute (>{timeout}s)", "-1"
 
-                # 合并 stdout 和 stderr 作为输出
-                output = result.stdout
-                if result.stderr:
-                    output += "\n" + result.stderr
-
-                # 处理退出码
-                exit_code = result.exit_code
-
-                # 如果命令超时（timeout 命令返回 124）
-                if exit_code == 124:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Internal Timeout via 'timeout' command: {timeout}s")
-                    return f"The command took too long to execute (>{timeout}s)", "-1"
-
-                if exit_code != 0:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})E2B exec Error: Exit code {exit_code}\nError Message: {output}")
-                    return output, f"Error: Exit code {exit_code}"
-                
-                # 移除 ANSI 转义码和 \r 字符
-                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
-                return output, str(exit_code)
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received resource limit from E2B sandbox during exec, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Received resource limit from E2B sandbox during exec, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
+                elif 'CommandExitException' in e.__class__.__name__:
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Failed to run command in E2B sandbox: {e}. The command is[{command}].")
+                    result = e
+                    pass
                 else:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})Unexpected error during E2B exec: {repr(e)}")
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Unexpected error during E2B exec: {repr(e)}")
                     return f"Error: {repr(e)}", "-1"
+
+            output = result.stdout
+            if result.stderr:
+                output += "\n" + result.stderr
+
+            exit_code = result.exit_code
+
+            if exit_code == 124:
+                self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Internal Timeout via 'timeout' command: {timeout}s")
+                return f"The command took too long to execute (>{timeout}s)", "-1"
+
+            if exit_code != 0:
+                self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Error: Exit code {exit_code}\nError Message: {output}")
+                return output, f"Error: Exit code {exit_code}"
+            
+            # Remove ANSI escape codes and \r characters from the combined output
+            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+            if 'PASSES' in output:
+                self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec PASSES: {output}")
+            return output, str(exit_code)
 
     def run(
         self,
@@ -1010,15 +1021,16 @@ class DockerRuntime(ExecutionEnvironment):
                             with open(src_file, "rb") as f:
                                 src_data = f.read()
                             self.sandbox.files.write(dest_file, src_data)
-                    self.logger.info(f"[{self.docker_image}]({self.template_id})Copied directory {src_path} to E2B sandbox at {dest_path}")
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Copied directory {src_path} to E2B sandbox at {dest_path}")
                 else:
                     with open(src_path, "rb") as f:
                         src_data = f.read()
                     self.sandbox.files.write(dest_path, src_data)
                     self.logger.info(f"Copied {src_path} to E2B sandbox at {dest_path}")
+                    break
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during copy, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Received 429 Too Many Requests from E2B sandbox during copy, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
                     continue
