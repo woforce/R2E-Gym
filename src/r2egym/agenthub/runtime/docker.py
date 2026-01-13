@@ -103,7 +103,7 @@ class DockerRuntime(ExecutionEnvironment):
     ):
         # check if ds is provided (required for all dockers moving forward)
         assert ds, f"Dataset not provided for docker image: {docker_image}"
-        assert backend in ["docker", "kubernetes", "e2b"], f"Invalid backend: {backend}"
+        assert backend in ["docker", "kubernetes", "e2b", "ppio"], f"Invalid backend: {backend}"
         # swebench specific setup
         self.ds = ds
         self.backend = backend
@@ -115,7 +115,7 @@ class DockerRuntime(ExecutionEnvironment):
         else:
             raise ValueError(f"No docker image found in ds: {self.ds}")
         self.docker_image = ds_image if not docker_image else docker_image
-        if self.backend == 'e2b':
+        if self.backend in ["e2b", "ppio"]:
             self.template_id = ds['template_id']
         self.swebench_verified = "swebench" in self.docker_image
         self.swesmith = "swesmith" in self.docker_image
@@ -150,6 +150,8 @@ class DockerRuntime(ExecutionEnvironment):
                 logger_name = "KubernetesRuntime"
             elif self.backend == "e2b":
                 logger_name = "E2BRuntime"
+            elif self.backend == "ppio":
+                logger_name = "PPIORuntime"
             else:
                 raise ValueError(f"Invalid backend: {self.backend}")
             self.logger = get_logger(logger_name)  # Pass the module name for clarity
@@ -165,7 +167,7 @@ class DockerRuntime(ExecutionEnvironment):
             except Exception:
                 config.load_kube_config()
             self.client = client.CoreV1Api()
-        elif self.backend == "e2b":
+        elif self.backend in ["e2b", "ppio"]:
             if not E2B_AVAILABLE:
                 raise ImportError("e2b package is not installed.")
             self.client = None
@@ -199,7 +201,7 @@ class DockerRuntime(ExecutionEnvironment):
                 else "N/A"
             )
             self.logger.info("Pod Name: %s", pod_name)
-        elif self.backend == "e2b":
+        elif self.backend in ["e2b", "ppio"]:
             sandbox_id = (
                 self.sandbox.sandbox_id
                 if hasattr(self, 'sandbox') and self.sandbox
@@ -387,30 +389,26 @@ class DockerRuntime(ExecutionEnvironment):
                              - e2b_template_id: E2B template ID to use (default: "base")
                              - api_key: E2B API key (if not set via env var)
         """
-        template_id = self.template_id
 
         backoff = 5
         while True:
             try:
-                self.sandbox = Sandbox.create(template=template_id, timeout=300)
+                self.sandbox = Sandbox.create(
+                    template=self.template_id,
+                    envs={'VIRTUAL_ENV': f'{self.repo_path}/.venv', 'DEBIAN_FRONTEND': 'noninteractive'},
+                    timeout=300
+                )
                 self.sandbox_id = self.sandbox.sandbox_id
-                if isinstance(command, list):
-                    command = shlex.join(command)
-                self.sandbox.commands.run(cmd=command)
                 self.container = self.sandbox
-                self.logger.info(f"E2B sandbox started: {self.sandbox.sandbox_id} (template: {template_id})")
+                self.logger.info(f"E2B sandbox started: {self.sandbox.sandbox_id} (template: {self.template_id})")
                 break
             except Exception as e:
                 if 'limit' in e.__str__():
-                    self.logger.warning(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
+                    self.logger.warning(f"[{self.docker_image}]({self.template_id})Received 429 Too Many Requests from E2B sandbox during start, retrying in {backoff}s...")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 40)
-                    continue
-                elif 'CommandExitException' in e.__class__.__name__:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Failed to start E2B sandbox: {e}. The command is[{command}].")
                 else:
-                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Failed to start E2B sandbox: {e}")
-                    raise
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})Failed to start E2B sandbox: {e}")
 
     def start_container(
         self, docker_image: str, command: str, ctr_name: str, **docker_kwargs
@@ -440,7 +438,7 @@ class DockerRuntime(ExecutionEnvironment):
                 self._start_kubernetes_pod(
                     docker_image, command, ctr_name, **docker_kwargs
                 )
-            elif self.backend == "e2b":
+            elif self.backend in ["e2b", "ppio"]:
                 self._start_e2b_sandbox_with_retry(
                     docker_image, command, ctr_name, **docker_kwargs
                 )
@@ -546,7 +544,7 @@ class DockerRuntime(ExecutionEnvironment):
                     self.container.remove()
                 elif self.backend == "kubernetes":
                     self._stop_kubernetes_pod()
-                elif self.backend == "e2b":
+                elif self.backend in ["e2b", "ppio"]:
                     self._stop_e2b_sandbox_with_retry()
         except Exception as e:
             print("Container stop/delete error:", repr(e))
@@ -662,7 +660,13 @@ class DockerRuntime(ExecutionEnvironment):
             # install required packages
             # self.run("uv pip install tree_sitter_languages") # remove since already installed in new dockers
 
-            self.run("uv pip install chardet")
+            # output, error_code = self.run("python --version")
+            # python_version = output.strip().split(" ")[-1]
+            # if python_version < "3.8":
+            #     # update python to 3.8
+            #     self.run("uv install python@3.8", max_rerun_times_on_timeout=1)
+
+            self.run("uv pip install chardet", max_rerun_times_on_timeout=1)
 
             self.run("find . -name '*.pyc' -delete")
 
@@ -674,6 +678,11 @@ class DockerRuntime(ExecutionEnvironment):
 
             # move all skip files (if present) to /root
             for skip_file in SKIP_FILES_NEW:
+                try:
+                    if not self.sandbox.files.exists(f"{self.repo_path}/{skip_file}"):
+                        continue
+                except Exception as e:
+                    self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Error checking if file exists: {repr(e)}")
                 self.run(f"mv {self.repo_path}/{skip_file} {self.alt_path}/{skip_file}")
 
             # r2e_tests are in the / directory, move them to /root
@@ -699,6 +708,7 @@ class DockerRuntime(ExecutionEnvironment):
         timeout: int = CMD_TIMEOUT,
         args: str = "",
         workdir: str = "",
+        max_rerun_times_on_timeout: int = 0,
     ) -> tuple[str, str]:
         """
         Kubernetes-specific method to execute code or commands in the pod, with a timeout.
@@ -759,7 +769,10 @@ class DockerRuntime(ExecutionEnvironment):
 
             if exit_code == 124:
                 self.logger.error(f"Internal Timeout via 'timeout' command: {timeout}s")
-                return f"The command took too long to execute (>{timeout}s)", "-1"
+                if max_rerun_times_on_timeout > 0:
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Kubernetes exec Internal Timeout via 'timeout' command: {timeout}s, retrying in {timeout}s...")
+                    return self._run_kubernetes(code, timeout, args, workdir=workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout - 1)
+                return f"The command took too long to execute (>{timeout}s)", "124"
 
             if exit_code != 0:
                 # Log format matches the docker version's error logging
@@ -788,7 +801,8 @@ class DockerRuntime(ExecutionEnvironment):
         timeout: int = CMD_TIMEOUT,
         args: str = "",
         workdir: str = "",
-        envs:Dict[str, str] = None,
+        envs: Dict[str, str] = None,
+        max_rerun_times_on_timeout: int = 0,
     ) -> tuple[str, str]:
         """
         在 E2B sandbox 中执行命令。
@@ -806,13 +820,14 @@ class DockerRuntime(ExecutionEnvironment):
         while True:
             try:
                 def execute_command():
-                    self.sandbox.set_timeout(300)
                     result = self.sandbox.commands.run(
                         cmd=command,
-                        cwd=workdir if workdir != "" else None,
+                        cwd=self.repo_path,
                         envs={"PATH": DOCKER_PATH},
                         timeout=timeout + 10,  # 命令连接超时，给一些缓冲时间
+                        user='root',
                     )
+                    self.sandbox.set_timeout(300)
                     # CommandResult includes stdout, stderr, exit_code, error
                     return result
 
@@ -847,7 +862,10 @@ class DockerRuntime(ExecutionEnvironment):
 
             if exit_code == 124:
                 self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Internal Timeout via 'timeout' command: {timeout}s")
-                return f"The command took too long to execute (>{timeout}s)", "-1"
+                if max_rerun_times_on_timeout > 0:
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Internal Timeout via 'timeout' command: {timeout}s, retrying in {timeout}s...")
+                    return self._run_e2b_with_retry(code, timeout, args, workdir=workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout - 1)
+                return f"The command took too long to execute (>{timeout}s)", "124"
 
             if exit_code != 0:
                 self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec Error: Exit code {exit_code}\nError Message: {output}")
@@ -859,29 +877,16 @@ class DockerRuntime(ExecutionEnvironment):
                 self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})E2B exec PASSES: {output}")
             return output, str(exit_code)
 
-    def run(
+    def _run_docker(
         self,
         code: str,
         timeout: int = CMD_TIMEOUT,
         args: str = "",
-        workdir=None,
-        type: str = None,
+        workdir: str = "",
+        max_rerun_times_on_timeout: int = 0,
     ) -> tuple[str, str]:
-        """
-        General method to execute code or commands in the container, with a timeout.
-
-        :param code: The code or command to execute.
-        :param args: Arguments to pass to the code/script.
-        :param workdir: The working directory inside the container (optional).
-        :return: A tuple containing (output, error_message). If no error, error_message is the exit code (str).
-        """
         exec_code = code
         exec_workdir = self.repo_path if workdir is None else workdir
-
-        if self.backend == "kubernetes":
-            return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir)
-        elif self.backend == "e2b":
-            return self._run_e2b_with_retry(exec_code, timeout, args, workdir=exec_workdir)
 
         command = f"timeout {timeout} {exec_code} {args}"
         try:
@@ -904,7 +909,10 @@ class DockerRuntime(ExecutionEnvironment):
 
             if error_code == 124:
                 self.logger.error(f"Internal Timeout: {timeout}s")
-                return f"The command took too long to execute (>{timeout}s)", "-1"
+                if max_rerun_times_on_timeout > 0:
+                    self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Docker exec Internal Timeout via 'timeout' command: {timeout}s, retrying in {timeout}s...")
+                    return self._run_docker(code, timeout, args, workdir=workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout - 1)
+                return f"The command took too long to execute (>{timeout}s)", "124"
 
             if error_code != 0:
                 self.logger.error(
@@ -923,6 +931,33 @@ class DockerRuntime(ExecutionEnvironment):
 
         except Exception as e:
             return f"Error: {repr(e)}", "-1"
+
+    def run(
+        self,
+        code: str,
+        timeout: int = CMD_TIMEOUT,
+        args: str = "",
+        workdir=None,
+        type: str = None,
+        max_rerun_times_on_timeout: int = 0,
+    ) -> tuple[str, str]:
+        """
+        General method to execute code or commands in the container, with a timeout.
+
+        :param code: The code or command to execute.
+        :param args: Arguments to pass to the code/script.
+        :param workdir: The working directory inside the container (optional).
+        :return: A tuple containing (output, error_message). If no error, error_message is the exit code (str).
+        """
+        exec_code = code
+        exec_workdir = self.repo_path if workdir is None else workdir
+
+        if self.backend == "kubernetes":
+            return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout)
+        elif self.backend in ["e2b", "ppio"]:
+            return self._run_e2b_with_retry(exec_code, timeout, args, workdir=exec_workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout)
+        else:
+            return self._run_docker(exec_code, timeout, args, workdir=exec_workdir, max_rerun_times_on_timeout=max_rerun_times_on_timeout)
 
     def demux_run(
         self, code: str, timeout: int = CMD_TIMEOUT, args: str = "", workdir=None
@@ -1012,7 +1047,6 @@ class DockerRuntime(ExecutionEnvironment):
         while True:
             try:
                 if os.path.isdir(src_path):
-                    self.sandbox.set_timeout(300)
                     for root, dirs, files in os.walk(src_path):
                         for file in files:
                             src_file = os.path.join(root, file)
@@ -1021,6 +1055,7 @@ class DockerRuntime(ExecutionEnvironment):
                             with open(src_file, "rb") as f:
                                 src_data = f.read()
                             self.sandbox.files.write(dest_file, src_data)
+                    self.sandbox.set_timeout(300)
                     self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Copied directory {src_path} to E2B sandbox at {dest_path}")
                 else:
                     with open(src_path, "rb") as f:
@@ -1051,7 +1086,7 @@ class DockerRuntime(ExecutionEnvironment):
         elif self.backend == "kubernetes":
             # Kubernetes pod copy
             return self._copy_to_container_kubernetes(src_path, dest_path)
-        elif self.backend == "e2b":
+        elif self.backend in ["e2b", "ppio"]:
             return self._copy_to_container_e2b_with_retry(src_path, dest_path)
 
     @DeprecationWarning  # TODO: remove dependency on this method with new dockers
@@ -1294,7 +1329,7 @@ class DockerRuntime(ExecutionEnvironment):
         self.stop_container()
         if self.backend == "docker":
             self.client.close()
-        elif self.backend == "e2b":
+        elif self.backend in ["e2b", "ppio"]:
             # E2B sandbox has been closed in stop_container
             pass
 
