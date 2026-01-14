@@ -391,6 +391,8 @@ class DockerRuntime(ExecutionEnvironment):
         """
 
         backoff = 5
+        attempt = 0
+        max_retries = 3
         while True:
             try:
                 self.sandbox = Sandbox.create(
@@ -409,6 +411,13 @@ class DockerRuntime(ExecutionEnvironment):
                     backoff = min(backoff * 2, 40)
                 else:
                     self.logger.error(f"[{self.docker_image}]({self.template_id})Failed to start E2B sandbox: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 40)
+                        attempt += 1
+                        continue
+                    else:
+                        raise
 
     def start_container(
         self, docker_image: str, command: str, ctr_name: str, **docker_kwargs
@@ -516,6 +525,8 @@ class DockerRuntime(ExecutionEnvironment):
         Stops and closes the E2B sandbox.
         """
         backoff = 2
+        attempt = 0
+        max_retries = 3
         while True:
             try:
                 if hasattr(self, 'sandbox') and self.sandbox:
@@ -534,7 +545,16 @@ class DockerRuntime(ExecutionEnvironment):
                     continue
                 else:
                     self.logger.error(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Error closing E2B sandbox: {e}")
-                    raise
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 40)
+                        attempt += 1
+                        continue
+                    else:
+                        self.sandbox = None
+                        self.sandbox_id = None
+                        self.container = None
+                        raise
 
     def stop_container(self):
         try:
@@ -1054,13 +1074,13 @@ class DockerRuntime(ExecutionEnvironment):
                             dest_file = os.path.join(dest_path, rel_path).replace("\\", "/")
                             with open(src_file, "rb") as f:
                                 src_data = f.read()
-                            self.sandbox.files.write(dest_file, src_data)
+                            self.sandbox.files.write(dest_file, src_data, user='root')
                     self.sandbox.set_timeout(300)
                     self.logger.info(f"[{self.docker_image}]({self.template_id})({self.sandbox_id})Copied directory {src_path} to E2B sandbox at {dest_path}")
                 else:
                     with open(src_path, "rb") as f:
                         src_data = f.read()
-                    self.sandbox.files.write(dest_path, src_data)
+                    self.sandbox.files.write(dest_path, src_data, user='root')
                     self.logger.info(f"Copied {src_path} to E2B sandbox at {dest_path}")
                     break
             except Exception as e:
