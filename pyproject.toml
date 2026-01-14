@@ -11,7 +11,7 @@ dependencies = [
     "asttokens>=2.4.1",
     "pydantic>=2.9.2",
     "matplotlib>=3.9.2",
-    "numpy>=2.1.1",
+    "numpy==1.26.4",
     "datasets==2.19",
     "ipython>=8.27.0",
     "pygments>=2.18.0",
