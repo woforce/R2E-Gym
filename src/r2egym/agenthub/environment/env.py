@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Any, Optional
 
-import gym
+import gymnasium as gym
 import logging
 
 from r2egym.agenthub.action import Action
